@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
-    <!-- Разрешаем использование незащищенных соединений (HTTP) для данного домена -->
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="true">91.243.71.120</domain>
-    </domain-config>
+    <!-- IP-адрес в теге domain система не считает именем хоста, поэтому HTTP до API режется.
+         Для этого магазинного приложения открытый HTTP разрешён целиком. -->
+    <base-config cleartextTrafficPermitted="true" />
 </network-security-config>

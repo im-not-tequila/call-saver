@@ -1,24 +1,33 @@
 package com.example.callsaver
 
-import android.app.*
-import android.content.ContentProviderOperation
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
+import android.database.ContentObserver
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
-import android.provider.ContactsContract
+import android.os.Looper
+import android.provider.CallLog
 import android.telephony.PhoneStateListener
 import android.telephony.TelephonyManager
 import android.util.Log
-import android.widget.Toast
-import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
-import androidx.work.PeriodicWorkRequest
+import androidx.core.content.ContextCompat
+import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.ExistingWorkPolicy
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import com.example.callsaver.ui.CallListener
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -37,33 +46,36 @@ import java.util.concurrent.TimeUnit
 class CallService : Service() {
     private lateinit var telephonyManager: TelephonyManager
     private lateinit var callListener: CallListener
-    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val serviceJob = SupervisorJob()
+    private val serviceScope = CoroutineScope(Dispatchers.IO + serviceJob)
     private val client = OkHttpClient()
+    private var callLogObserver: ContentObserver? = null
 
-    @RequiresApi(Build.VERSION_CODES.O)
     override fun onCreate() {
         super.onCreate()
-
-        // Получаем сохранённый номер телефона
-        val sharedPreferences = getSharedPreferences("call_logs", Context.MODE_PRIVATE)
-        val shopPhoneNumber = sharedPreferences.getString("shop_phone_number", null)
-
-        startRepeatingRequest(shopPhoneNumber)
-
-        Log.d("CallService", "Сервис создан")
+        startAsForeground()
+        IncomingCallRecorder.ensureCallLogCursor(this)
+        Log.d(TAG, "Сервис создан")
         callListener = CallListener(this)
-        startForegroundService()
+        startRepeatingRequest()
+        try {
+            schedulePeriodicRestart()
+        } catch (e: Exception) {
+            Log.e(TAG, "Не удалось запланировать периодический перезапуск", e)
+        }
     }
 
-    private fun startRepeatingRequest(phoneNumber: String?) {
+    private fun startRepeatingRequest() {
         serviceScope.launch {
             while (isActive) {
-                if (phoneNumber != null) {
-                    sendPostRequest(phoneNumber)
+                val shopPhoneNumber = getSharedPreferences("call_logs", Context.MODE_PRIVATE)
+                    .getString("shop_phone_number", null)
+                if (!shopPhoneNumber.isNullOrBlank()) {
+                    sendPostRequest(shopPhoneNumber)
                 } else {
-                    Log.e("CallService", "shop_phone_number не найден в SharedPreferences")
+                    Log.e(TAG, "shop_phone_number не найден в SharedPreferences")
                 }
-                delay(15_000) // 15 секунд
+                delay(15_000)
             }
         }
     }
@@ -80,40 +92,33 @@ class CallService : Service() {
             .post(body)
             .build()
 
-// 🔍 Логируем запрос
-        Log.d("CallService", "Отправка запроса:")
-        Log.d("CallService", "URL: $url")
-        Log.d("CallService", "Тело запроса: ${json.toString()}")
-        Log.d("CallService", "Заголовки: ${request.headers}")
+        Log.d(TAG, "Отправка запроса: $url ${json}")
 
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                Log.e("CallService", "Ошибка запроса: ${e.message}")
+                Log.e(TAG, "Ошибка запроса: ${e.message}")
             }
 
             override fun onResponse(call: Call, response: Response) {
                 if (response.isSuccessful) {
                     val responseData = response.body?.string()
-                    Log.d("CallService", "Ответ от сервера: $responseData")
+                    Log.d(TAG, "Ответ от сервера: $responseData")
 
                     try {
                         val jsonArray = JSONArray(responseData)
                         for (i in 0 until jsonArray.length()) {
                             val obj = jsonArray.getJSONObject(i)
                             val number = obj.getString("phone_number")
-                            Log.e("CallService", number)
-                            // Пропускаем номер магазина
                             if (number != phoneNumber) {
-                                Log.e("CallService", "Метод $number")
                                 saveNumber(applicationContext, number, "Whatsapp")
                                 saveContact(applicationContext, number)
                             }
                         }
                     } catch (e: Exception) {
-                        Log.e("CallService", "Ошибка разбора JSON: ${e.message}")
+                        Log.e(TAG, "Ошибка разбора JSON: ${e.message}")
                     }
                 } else {
-                    Log.e("CallService", "Ошибка ответа: ${response.code}")
+                    Log.e(TAG, "Ошибка ответа: ${response.code}")
                 }
             }
         })
@@ -122,52 +127,80 @@ class CallService : Service() {
     private fun isContactExists(context: Context, phoneNumber: String): Boolean {
         val resolver = context.contentResolver
         val cursor = resolver.query(
-            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-            arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER),
-            "${ContactsContract.CommonDataKinds.Phone.NUMBER} = ?",
+            android.provider.ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+            arrayOf(android.provider.ContactsContract.CommonDataKinds.Phone.NUMBER),
+            "${android.provider.ContactsContract.CommonDataKinds.Phone.NUMBER} = ?",
             arrayOf(phoneNumber),
             null
         )
 
-        val exists = cursor != null && cursor.moveToFirst() // Если курсор не пустой, значит номер уже есть
+        val exists = cursor != null && cursor.moveToFirst()
         cursor?.close()
         return exists
     }
 
+    @Suppress("DEPRECATION")
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Log.d("CallService", "Call tracking service started")
+        Log.d(TAG, "Call tracking service started")
+        startAsForeground()
 
         telephonyManager = getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
-        telephonyManager.listen(callListener, PhoneStateListener.LISTEN_CALL_STATE)
+        if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.READ_PHONE_STATE)
+            == PackageManager.PERMISSION_GRANTED
+        ) {
+            telephonyManager.listen(callListener, PhoneStateListener.LISTEN_CALL_STATE)
+        } else {
+            Log.e(TAG, "Нет разрешения на состояние телефона")
+        }
+        registerCallLogObserver()
+        IncomingCallRecorder.consumeRecentCallLog(this)
 
-        return START_STICKY // Позволяет сервису перезапускаться после остановки
+        return START_STICKY
     }
 
+    @Suppress("DEPRECATION")
     override fun onDestroy() {
+        serviceScope.cancel()
+        callLogObserver?.let { contentResolver.unregisterContentObserver(it) }
+        callLogObserver = null
+        if (::telephonyManager.isInitialized && ::callListener.isInitialized) {
+            telephonyManager.listen(callListener, PhoneStateListener.LISTEN_NONE)
+            callListener.dispose()
+        }
+        try {
+            val once = OneTimeWorkRequestBuilder<RestartServiceWorker>()
+                .setInitialDelay(10, TimeUnit.SECONDS)
+                .build()
+            WorkManager.getInstance(applicationContext).enqueueUniqueWork(
+                "restart-call-service-once",
+                ExistingWorkPolicy.REPLACE,
+                once
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Не удалось запланировать перезапуск", e)
+        }
         super.onDestroy()
-        Log.d("CallService", "Сервис уничтожен, перезапускаем...")
-        Toast.makeText(baseContext, "Сервис уничтожен, перезапускаем...", Toast.LENGTH_LONG).show()
-        // Остановить слушателя
-        telephonyManager.listen(callListener, PhoneStateListener.LISTEN_NONE)
-
-        // Перезапуск сервиса
-        restartService()
-        restartServiceWithAlarm()
-        val workRequest = PeriodicWorkRequest.Builder(
-            RestartServiceWorker::class.java,
-            15, TimeUnit.MINUTES // Интервал перезапуска
-        ).build()
-
-        WorkManager.getInstance(baseContext).enqueue(workRequest)
+        Log.d(TAG, "Сервис уничтожен, перезапуск поставлен в очередь")
     }
 
-    @RequiresApi(Build.VERSION_CODES.O)
-    private fun startForegroundService() {
-        val channelId = "call_tracking_service"
-        val channelName = "Call Tracking"
+    private fun schedulePeriodicRestart() {
+        val periodic = PeriodicWorkRequestBuilder<RestartServiceWorker>(15, TimeUnit.MINUTES)
+            .build()
+        WorkManager.getInstance(applicationContext).enqueueUniquePeriodicWork(
+            "restart-call-service",
+            ExistingPeriodicWorkPolicy.KEEP,
+            periodic
+        )
+    }
 
+    private fun startAsForeground() {
+        val channelId = "call_tracking_service"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(channelId, channelName, NotificationManager.IMPORTANCE_HIGH).apply {
+            val channel = NotificationChannel(
+                channelId,
+                "Call Tracking",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
                 setSound(null, null)
                 enableLights(false)
                 enableVibration(false)
@@ -179,29 +212,34 @@ class CallService : Service() {
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("Мир Телевизоров")
             .setContentText("Наблюдение за входящими звонками...")
-            .setSmallIcon(R.drawable.ic_television)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setOngoing(true) // Нельзя удалить свайпом
+            .setSmallIcon(R.drawable.ic_call)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setOngoing(true)
             .build()
 
-        startForeground(1, notification)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
     }
 
-    private fun restartService() {
-        val restartIntent = Intent(this, ServiceRestartReceiver::class.java)
-        sendBroadcast(restartIntent)
-    }
+    private fun registerCallLogObserver() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        if (callLogObserver != null) return
+        if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.READ_CALL_LOG)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
 
-    private fun restartServiceWithAlarm() {
-        val intent = Intent(this, CallService::class.java)
-        val pendingIntent = PendingIntent.getService(
-            this, 1, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-
-        val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val triggerTime = System.currentTimeMillis() + 10 * 1000 // Через 10 секунд
-
-        alarmManager.setExact(AlarmManager.RTC_WAKEUP, triggerTime, pendingIntent)
+        val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+            override fun onChange(selfChange: Boolean) {
+                IncomingCallRecorder.consumeRecentCallLog(this@CallService)
+            }
+        }
+        contentResolver.registerContentObserver(CallLog.Calls.CONTENT_URI, true, observer)
+        callLogObserver = observer
     }
 
     private fun saveNumber(context: Context, number: String, type: String) {
@@ -211,9 +249,8 @@ class CallService : Service() {
         val calls = sharedPrefs.getString("calls", "") ?: ""
         val currentId = sharedPrefs.getInt("call_count", 0)
 
-        // Проверка: если номер уже есть в списке — не добавляем
         if (calls.contains(number)) {
-            Log.d("CallService", "Номер $number уже сохранён, пропускаем.")
+            Log.d(TAG, "Номер $number уже сохранён, пропускаем.")
             return
         }
 
@@ -225,7 +262,7 @@ class CallService : Service() {
         editor.putInt("call_count", currentId + 1)
         editor.apply()
 
-        Log.d("CallService", "Сохранён новый номер: $newCall")
+        Log.d(TAG, "Сохранён новый номер: $newCall")
     }
 
     fun getNextClientIndex(context: Context): Int {
@@ -236,63 +273,76 @@ class CallService : Service() {
     }
 
     fun saveContact(context: Context, phoneNumber: String) {
-        if (phoneNumber.isBlank()) return // Если номер пустой - выходим
-        if (isContactExists(applicationContext, phoneNumber)) return // Если номер пустой - выходим
+        if (phoneNumber.isBlank()) return
+        if (isContactExists(applicationContext, phoneNumber)) return
 
         val resolver = context.contentResolver
         val cursor = resolver.query(
-            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-            arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER),
-            ContactsContract.CommonDataKinds.Phone.NUMBER + " = ?",
+            android.provider.ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+            arrayOf(android.provider.ContactsContract.CommonDataKinds.Phone.NUMBER),
+            android.provider.ContactsContract.CommonDataKinds.Phone.NUMBER + " = ?",
             arrayOf(phoneNumber),
             null
         )
 
-        // Проверяем, есть ли уже этот контакт в телефоне
         if (cursor != null && cursor.moveToFirst()) {
             cursor.close()
-            Log.d("CallService", "Контакт уже существует: $phoneNumber")
+            Log.d(TAG, "Контакт уже существует: $phoneNumber")
             return
         }
         cursor?.close()
 
-        // Получаем номер следующего клиента
         val clientIndex = getNextClientIndex(context)
-
-        // Создаём новый контакт
-        val contactOperations = ArrayList<ContentProviderOperation>()
+        val contactOperations = ArrayList<android.content.ContentProviderOperation>()
 
         contactOperations.add(
-            ContentProviderOperation.newInsert(ContactsContract.RawContacts.CONTENT_URI)
-                .withValue(ContactsContract.RawContacts.ACCOUNT_TYPE, null)
-                .withValue(ContactsContract.RawContacts.ACCOUNT_NAME, null)
+            android.content.ContentProviderOperation.newInsert(android.provider.ContactsContract.RawContacts.CONTENT_URI)
+                .withValue(android.provider.ContactsContract.RawContacts.ACCOUNT_TYPE, null)
+                .withValue(android.provider.ContactsContract.RawContacts.ACCOUNT_NAME, null)
                 .build()
         )
 
         contactOperations.add(
-            ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI)
-                .withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, 0)
-                .withValue(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.StructuredName.CONTENT_ITEM_TYPE)
-                .withValue(ContactsContract.CommonDataKinds.StructuredName.DISPLAY_NAME, "Клиент $clientIndex")
+            android.content.ContentProviderOperation.newInsert(android.provider.ContactsContract.Data.CONTENT_URI)
+                .withValueBackReference(android.provider.ContactsContract.Data.RAW_CONTACT_ID, 0)
+                .withValue(
+                    android.provider.ContactsContract.Data.MIMETYPE,
+                    android.provider.ContactsContract.CommonDataKinds.StructuredName.CONTENT_ITEM_TYPE
+                )
+                .withValue(
+                    android.provider.ContactsContract.CommonDataKinds.StructuredName.DISPLAY_NAME,
+                    "Клиент $clientIndex"
+                )
                 .build()
         )
 
         contactOperations.add(
-            ContentProviderOperation.newInsert(ContactsContract.Data.CONTENT_URI)
-                .withValueBackReference(ContactsContract.Data.RAW_CONTACT_ID, 0)
-                .withValue(ContactsContract.Data.MIMETYPE, ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE)
-                .withValue(ContactsContract.CommonDataKinds.Phone.NUMBER, phoneNumber)
-                .withValue(ContactsContract.CommonDataKinds.Phone.TYPE, ContactsContract.CommonDataKinds.Phone.TYPE_MOBILE)
+            android.content.ContentProviderOperation.newInsert(android.provider.ContactsContract.Data.CONTENT_URI)
+                .withValueBackReference(android.provider.ContactsContract.Data.RAW_CONTACT_ID, 0)
+                .withValue(
+                    android.provider.ContactsContract.Data.MIMETYPE,
+                    android.provider.ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE
+                )
+                .withValue(android.provider.ContactsContract.CommonDataKinds.Phone.NUMBER, phoneNumber)
+                .withValue(
+                    android.provider.ContactsContract.CommonDataKinds.Phone.TYPE,
+                    android.provider.ContactsContract.CommonDataKinds.Phone.TYPE_MOBILE
+                )
                 .build()
         )
 
         try {
-            resolver.applyBatch(ContactsContract.AUTHORITY, contactOperations)
-            Log.d("CallService", "Контакт сохранен: Клиент $clientIndex ($phoneNumber)")
+            resolver.applyBatch(android.provider.ContactsContract.AUTHORITY, contactOperations)
+            Log.d(TAG, "Контакт сохранен: Клиент $clientIndex ($phoneNumber)")
         } catch (e: Exception) {
-            Log.e("CallService", "Ошибка сохранения контакта", e)
+            Log.e(TAG, "Ошибка сохранения контакта", e)
         }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    companion object {
+        private const val TAG = "CallService"
+        private const val NOTIFICATION_ID = 1
+    }
 }

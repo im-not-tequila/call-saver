@@ -28,9 +28,11 @@ import android.app.AlertDialog
 import android.content.ContentProviderOperation
 import android.net.Uri
 import android.provider.ContactsContract
+import android.app.role.RoleManager
 import android.provider.Settings
 import android.widget.Toast
 import androidx.core.app.ActivityCompat
+import com.example.callsaver.ui.CallListener
 
 class MainActivity : ComponentActivity() {
     companion object {
@@ -38,28 +40,12 @@ class MainActivity : ComponentActivity() {
         const val REQUEST_CODE_FOREGROUND_SERVICE = 103
     }
 
-    private val phoneStateListener = object : PhoneStateListener() {
-        override fun onCallStateChanged(state: Int, phoneNumber: String?) {
-            super.onCallStateChanged(state, phoneNumber)
+    private val phoneStateListener = CallListener(this)
 
-            when (state) {
-                TelephonyManager.CALL_STATE_IDLE -> {
-                    Log.d("CallService", "Телефон не в звонке")
-                }
-
-                TelephonyManager.CALL_STATE_RINGING -> {
-                    Log.d("CallService", "Входящий звонок от: $phoneNumber")
-                    if (!phoneNumber.isNullOrBlank()) {
-                        saveContact(this@MainActivity, phoneNumber)
-                    }
-                }
-
-                TelephonyManager.CALL_STATE_OFFHOOK -> {
-                    Log.d("CallService", "Телефон в режиме разговора")
-                }
-            }
+    private val callScreeningRoleLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            Log.d("CallScreening", "Роль фильтра звонков: ${result.resultCode}")
         }
-    }
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
@@ -72,10 +58,11 @@ class MainActivity : ComponentActivity() {
                 )
             }
 
-            if (permissions[Manifest.permission.READ_PHONE_STATE] == true) {
-                initializePhoneStateListener()
-            } else {
+            if (permissions[Manifest.permission.READ_PHONE_STATE] == false) {
                 Toast.makeText(this, "Нет доступа к состоянию телефона!", Toast.LENGTH_LONG).show()
+            }
+            if (hasPermission(Manifest.permission.READ_PHONE_STATE)) {
+                initializePhoneStateListener()
             }
 
             if (permissions[Manifest.permission.WRITE_CONTACTS] == true) {
@@ -88,52 +75,78 @@ class MainActivity : ComponentActivity() {
                     saveContact(this, pendingNumber)
                     sharedPrefs.edit().remove("pending_number").apply()
                 }
-            } else {
+            } else if (permissions[Manifest.permission.WRITE_CONTACTS] == false) {
                 Toast.makeText(this, "Нет доступа к контактам!", Toast.LENGTH_LONG).show()
             }
 
-            if (permissions[Manifest.permission.READ_CALL_LOG] == true) {
-                Log.d("CallService", "Разрешение на чтение истории звонков получено")
-            } else {
+            if (permissions[Manifest.permission.READ_CALL_LOG] == false) {
                 Toast.makeText(this, "Нет доступа к журналу звонков!", Toast.LENGTH_LONG).show()
             }
-
-            if (permissions[Manifest.permission.RECEIVE_BOOT_COMPLETED] != true) {
-                Toast.makeText(
-                    this,
-                    "Разрешение RECEIVE_BOOT_COMPLETED не предоставлено!",
-                    Toast.LENGTH_LONG
-                ).show()
+            if (permissions[Manifest.permission.POST_NOTIFICATIONS] == false) {
+                Toast.makeText(this, "Нет разрешения на уведомления!", Toast.LENGTH_LONG).show()
             }
 
-            if (permissions[Manifest.permission.FOREGROUND_SERVICE] != true) {
-                Toast.makeText(this, "Нет разрешения на фоновый сервис!", Toast.LENGTH_LONG).show()
-            }
+            startCallService()
+            requestCallScreeningRole(automatic = true)
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Запрос разрешений для чтения состояния телефона и истории звонков
-        requestPermissionsIfNeeded()
-        checkAndRequestPermissions(this)
-        // Запуск фонового сервиса
+        val askedForPermissions = requestPermissionsIfNeeded()
         startCallService()
         createNotificationChannel()
         setContent {
-            CallLoggerApp(context = this)
+            CallLoggerApp(
+                context = this,
+                onRequestCallScreening = { requestCallScreeningRole(automatic = false) }
+            )
         }
         checkAndRequestBatteryOptimization(this)
+        if (!askedForPermissions) {
+            requestCallScreeningRole(automatic = true)
+        }
     }
 
-    private fun requestPermissionsIfNeeded() {
-        val permissions = arrayOf(
+    private fun hasPermission(permission: String): Boolean {
+        return checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun requestCallScreeningRole(automatic: Boolean) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        val roleManager = getSystemService(RoleManager::class.java) ?: return
+        if (!roleManager.isRoleAvailable(RoleManager.ROLE_CALL_SCREENING)) {
+            if (!automatic) {
+                Toast.makeText(this, "На этом телефоне нет фильтра звонков", Toast.LENGTH_LONG).show()
+            }
+            return
+        }
+        if (roleManager.isRoleHeld(RoleManager.ROLE_CALL_SCREENING)) {
+            if (!automatic) {
+                Toast.makeText(this, "Определение номера уже включено", Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
+        val prefs = getSharedPreferences("call_logs", Context.MODE_PRIVATE)
+        if (automatic && prefs.getBoolean("screening_prompt_shown", false)) return
+        if (automatic) {
+            prefs.edit().putBoolean("screening_prompt_shown", true).apply()
+        }
+        callScreeningRoleLauncher.launch(
+            roleManager.createRequestRoleIntent(RoleManager.ROLE_CALL_SCREENING)
+        )
+    }
+
+    private fun requestPermissionsIfNeeded(): Boolean {
+        val permissions = mutableListOf(
             Manifest.permission.READ_PHONE_STATE,
             Manifest.permission.READ_CALL_LOG,
-            Manifest.permission.RECEIVE_BOOT_COMPLETED,
-            Manifest.permission.FOREGROUND_SERVICE,
-            Manifest.permission.MANAGE_OWN_CALLS
+            Manifest.permission.READ_CONTACTS,
+            Manifest.permission.WRITE_CONTACTS
         )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
 
         val permissionsToRequest = permissions.filter {
             checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
@@ -141,37 +154,19 @@ class MainActivity : ComponentActivity() {
 
         if (permissionsToRequest.isNotEmpty()) {
             requestPermissionLauncher.launch(permissionsToRequest)
-        } else {
-            // Разрешения уже предоставлены, запускаем слушатель
-            initializePhoneStateListener()
+            return true
         }
+        initializePhoneStateListener()
+        return false
     }
 
+    @Suppress("DEPRECATION")
     private fun initializePhoneStateListener() {
         val telephonyManager = getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
-        if (ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.READ_PHONE_STATE
-            ) == PackageManager.PERMISSION_GRANTED
-        ) {
+        if (hasPermission(Manifest.permission.READ_PHONE_STATE)) {
             telephonyManager.listen(phoneStateListener, PhoneStateListener.LISTEN_CALL_STATE)
         } else {
             Log.e("CallService", "Нет разрешения на прослушивание состояния звонков")
-        }
-    }
-
-    fun checkAndRequestPermissions(activity: Activity) {
-        val permissions = arrayOf(
-            Manifest.permission.READ_CONTACTS,
-            Manifest.permission.WRITE_CONTACTS
-        )
-
-        val missingPermissions = permissions.filter {
-            ContextCompat.checkSelfPermission(activity, it) != PackageManager.PERMISSION_GRANTED
-        }
-
-        if (missingPermissions.isNotEmpty()) {
-            ActivityCompat.requestPermissions(activity, missingPermissions.toTypedArray(), 1001)
         }
     }
 
@@ -198,10 +193,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    @Suppress("DEPRECATION")
     override fun onDestroy() {
         super.onDestroy()
         val telephonyManager = getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
         telephonyManager.listen(phoneStateListener, PhoneStateListener.LISTEN_NONE)
+        phoneStateListener.dispose()
     }
 }
 
@@ -221,7 +218,7 @@ fun checkAndRequestPermissions(activity: Activity) {
 }
 
 @Composable
-fun CallLoggerApp(context: Context) {
+fun CallLoggerApp(context: Context, onRequestCallScreening: () -> Unit) {
     val sharedPreferences = context.getSharedPreferences("call_logs", Context.MODE_PRIVATE)
     var shopPhoneNumber by remember {
         mutableStateOf(
@@ -270,6 +267,28 @@ fun CallLoggerApp(context: Context) {
                         modifier = Modifier.padding(start = 8.dp)
                     ) {
                         Text("Проверить")
+                    }
+                }
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 16.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = "На Android 10 и новее включите определение номера входящего.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.weight(1f)
+                        )
+
+                        Button(
+                            onClick = onRequestCallScreening,
+                            modifier = Modifier.padding(start = 8.dp)
+                        ) {
+                            Text("Включить")
+                        }
                     }
                 }
 

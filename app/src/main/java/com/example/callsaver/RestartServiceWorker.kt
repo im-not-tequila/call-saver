@@ -3,7 +3,8 @@ package com.example.callsaver
 import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
-import android.os.Build
+import android.util.Log
+import androidx.core.content.ContextCompat
 import androidx.work.Worker
 import androidx.work.WorkerParameters
 
@@ -14,15 +15,16 @@ class RestartServiceWorker(
 
     override fun doWork(): Result {
         val context = applicationContext
-        if (!isServiceRunning(context, CallService::class.java)) {
-            val serviceIntent = Intent(context, CallService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(serviceIntent)
-            } else {
-                context.startService(serviceIntent)
-            }
+        if (isServiceRunning(context, CallService::class.java)) {
+            return Result.success()
         }
-        return Result.success()
+        return try {
+            ContextCompat.startForegroundService(context, Intent(context, CallService::class.java))
+            Result.success()
+        } catch (e: Exception) {
+            Log.e("RestartServiceWorker", "Не удалось перезапустить сервис", e)
+            Result.retry()
+        }
     }
 
     private fun isServiceRunning(context: Context, serviceClass: Class<*>): Boolean {

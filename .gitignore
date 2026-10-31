@@ -1,15 +1,47 @@
-*.iml
-.gradle
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
-.DS_Store
-/build
-/captures
-.externalNativeBuild
-.cxx
+# Gradle
+.gradle/
+build/
+**/build/
+
+# Local SDK path
 local.properties
+
+# Android Studio / IntelliJ
+*.iml
+.idea/caches/
+.idea/libraries/
+.idea/modules.xml
+.idea/workspace.xml
+.idea/navEditor.xml
+.idea/assetWizardSettings.xml
+.idea/tasks.xml
+.idea/gradle.xml
+.idea/dictionaries/
+.idea/shelf/
+.navigation/
+captures/
+.externalNativeBuild/
+.cxx/
+.kotlin/
+
+# Build outputs
+*.apk
+*.ap_
+*.aab
+*.aar
+*.dex
+*.class
+bin/
+gen/
+out/
+
+# Signing secrets. Passwords and the keystore stay on the machine that builds the release.
+*.jks
+*.keystore
+keystore.properties
+keystore/
+
+# OS / logs / profiling
+.DS_Store
+*.log
+*.hprof

@@ -3,16 +3,17 @@ package com.example.callsaver
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.os.Build
 
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
-            val serviceIntent = Intent(context, CallService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(serviceIntent)
-            } else {
-                context.startService(serviceIntent)
+            try {
+                androidx.core.content.ContextCompat.startForegroundService(
+                    context,
+                    Intent(context, CallService::class.java)
+                )
+            } catch (e: Exception) {
+                android.util.Log.e("BootReceiver", "Не удалось запустить сервис", e)
             }
         }
     }
